@@ -1,0 +1,42 @@
+# Конфигурация для трёх стереопар.
+# Используется как альтернатива хардкоду в launch-файле:
+#
+#   Node(
+#       ...,
+#       parameters=['/path/to/cameras.yaml'],
+#   )
+#
+# Неймспейсы совпадают с launch/stereo_cameras.launch.py:
+#   front_cams — центральная пара
+#   left_cams  — левая пара
+#   right_cams — правая пара
+
+/front_cams/stereo_camera_node:
+  ros__parameters:
+    left_camera_path:  /dev/v4l/by-path/PLACEHOLDER_CENTER_PAIR_LEFT_CAM
+    right_camera_path: /dev/v4l/by-path/PLACEHOLDER_CENTER_PAIR_RIGHT_CAM
+    camera_fps:   30.0
+    frame_width:  640
+    frame_height: 480
+    frame_id_left:  front_cams/f_left_camera_optical
+    frame_id_right: front_cams/f_right_camera_optical
+
+/left_cams/stereo_camera_node:
+  ros__parameters:
+    left_camera_path:  /dev/v4l/by-path/PLACEHOLDER_LEFT_PAIR_LEFT_CAM
+    right_camera_path: /dev/v4l/by-path/PLACEHOLDER_LEFT_PAIR_RIGHT_CAM
+    camera_fps:   30.0
+    frame_width:  640
+    frame_height: 480
+    frame_id_left:  left_cams/l_left_camera_optical
+    frame_id_right: left_cams/l_right_camera_optical
+
+/right_cams/stereo_camera_node:
+  ros__parameters:
+    left_camera_path:  /dev/v4l/by-path/PLACEHOLDER_RIGHT_PAIR_LEFT_CAM
+    right_camera_path: /dev/v4l/by-path/PLACEHOLDER_RIGHT_PAIR_RIGHT_CAM
+    camera_fps:   30.0
+    frame_width:  640
+    frame_height: 480
+    frame_id_left:  right_cams/r_left_camera_optical
+    frame_id_right: right_cams/r_right_camera_optical
