@@ -29,10 +29,57 @@ import glob
 import os
 import subprocess
 import sys
+import threading
 import time
 
 import cv2
 import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Захват в отдельном потоке
+# ---------------------------------------------------------------------------
+
+class FrameGrabber:
+    """
+    Читает кадры из cap.read() в фоновом потоке непрерывно.
+    Главный поток забирает последний готовый кадр без ожидания камеры.
+
+    Это разделяет скорость захвата и скорость отображения:
+    камера работает на своём максимальном FPS независимо от дисплея.
+    """
+
+    def __init__(self, cap: cv2.VideoCapture):
+        self._cap      = cap
+        self._frame    = None
+        self._ret      = False
+        self._lock     = threading.Lock()
+        self._stopped  = False
+        self._grabbed  = 0   # счётчик захваченных кадров
+        t = threading.Thread(target=self._loop, daemon=True)
+        t.start()
+
+    def _loop(self) -> None:
+        while not self._stopped:
+            ret, frame = self._cap.read()
+            with self._lock:
+                self._ret   = ret
+                self._frame = frame
+                if ret:
+                    self._grabbed += 1
+
+    def read(self) -> tuple[bool, np.ndarray | None]:
+        """Возвращает последний захваченный кадр (без ожидания)."""
+        with self._lock:
+            return self._ret, self._frame
+
+    @property
+    def grabbed(self) -> int:
+        with self._lock:
+            return self._grabbed
+
+    def stop(self) -> None:
+        self._stopped = True
 
 
 # ---------------------------------------------------------------------------
@@ -72,37 +119,32 @@ def list_cameras() -> None:
 
 def open_cap(device: str, width: int, height: int, fps: float,
              mjpg: bool = True) -> cv2.VideoCapture:
-    # Определяем путь к устройству для v4l2-ctl
     dev_path = f'/dev/video{device}' if device.lstrip('-').isdigit() else device
+    src      = int(device) if device.lstrip('-').isdigit() else device
 
-    if mjpg:
-        # Выставляем формат через v4l2-ctl ДО открытия OpenCV —
-        # это надёжнее, чем CAP_PROP_FOURCC (OpenCV может сбросить формат
-        # при выставлении ширины/высоты)
-        result = subprocess.run(
-            [
-                'v4l2-ctl', '--device', dev_path,
-                f'--set-fmt-video=width={width},height={height},pixelformat=MJPG',
-                f'--set-parm={int(fps)}',
-            ],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            print(f'[WARN] v4l2-ctl не смог выставить MJPG: {result.stderr.strip()}')
-            print('[WARN] Попытка выставить через OpenCV...')
-
-    src = int(device) if device.lstrip('-').isdigit() else device
+    # Шаг 1: открываем устройство (стриминг ещё не запущен)
     cap = cv2.VideoCapture(src, cv2.CAP_V4L2)
     if not cap.isOpened():
         print(f'[ERROR] Не удалось открыть: {device}', file=sys.stderr)
         sys.exit(1)
-    # OpenCV дублирует параметры (на случай если v4l2-ctl недоступен)
-    if mjpg:
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    cap.set(cv2.CAP_PROP_FPS,          fps)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+
+    # Шаг 2: выставляем формат через v4l2-ctl ПОСЛЕ открытия, но ДО первого read().
+    # Важно: НЕ вызывать cap.set(WIDTH/HEIGHT/FOURCC) после этого —
+    # иначе OpenCV снова переговорит формат и сбросит MJPG обратно на YUYV.
+    pixfmt = 'MJPG' if mjpg else 'YUYV'
+    result = subprocess.run(
+        [
+            'v4l2-ctl', '--device', dev_path,
+            f'--set-fmt-video=width={width},height={height},pixelformat={pixfmt}',
+            f'--set-parm={int(fps)}',
+        ],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f'[WARN] v4l2-ctl: {result.stderr.strip()}')
+
+    # Шаг 3: только размер буфера — не трогаем формат
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return cap
 
 
@@ -124,13 +166,6 @@ def annotate(frame: np.ndarray, label: str, fps: float, n: int) -> None:
 
 
 
-def print_stats(t_start: float, n: int, d: int = 0) -> tuple[float, float]:
-    el = time.monotonic() - t_start
-    fps = n / el if el > 0 else 0.0
-    print(f'\r  Кадров:{n:6d}  FPS:{fps:5.1f}  Пропусков:{d:3d}  Время:{el:6.1f}с  ',
-          end='', flush=True)
-    return fps, el
-
 
 # ---------------------------------------------------------------------------
 # Режим одной камеры
@@ -138,29 +173,39 @@ def print_stats(t_start: float, n: int, d: int = 0) -> tuple[float, float]:
 
 def run_single(cap: cv2.VideoCapture, label: str, no_display: bool,
                show_every: int = 1) -> None:
+    grabber = FrameGrabber(cap)
     win = f'Camera {label}  [q - выход]'
     if not no_display:
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    n, fps, t = 0, 0.0, time.monotonic()
+    disp_n, fps, t = 0, 0.0, time.monotonic()
     print(f'\nЗахват [{label}]. q / Ctrl-C для выхода.\n')
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                time.sleep(0.05)
+            ret, frame = grabber.read()
+            if not ret or frame is None:
+                time.sleep(0.005)
                 continue
-            n += 1
-            fps, _ = print_stats(t, n)
-            if not no_display and n % show_every == 0:
-                annotate(frame, label, fps, n)
-                cv2.imshow(win, frame)
+            cap_n = grabber.grabbed
+            el    = time.monotonic() - t
+            fps   = cap_n / el if el > 0 else 0.0
+            print(f'\r  Захват:{cap_n:6d}  FPS:{fps:5.1f}  Время:{el:6.1f}с  ',
+                  end='', flush=True)
+            disp_n += 1
+            if not no_display and disp_n % show_every == 0:
+                f = frame.copy()
+                annotate(f, label, fps, cap_n)
+                cv2.imshow(win, f)
                 if cv2.waitKey(1) & 0xFF in (ord('q'), ord('Q'), 27):
                     break
+            else:
+                time.sleep(0.005)
     except KeyboardInterrupt:
         pass
     finally:
-        _, el = print_stats(t, n)
-        print(f'\n\nИтого: {n} кадров за {el:.1f}с')
+        grabber.stop()
+        el = time.monotonic() - t
+        print(f'\n\nИтого: {grabber.grabbed} кадров за {el:.1f}с  '
+              f'(FPS: {grabber.grabbed / el:.1f})')
         if not no_display:
             cv2.destroyAllWindows()
 
@@ -172,46 +217,56 @@ def run_single(cap: cv2.VideoCapture, label: str, no_display: bool,
 def run_split(cap: cv2.VideoCapture, device: str, no_display: bool,
               show_every: int = 1) -> None:
     """
-    Захватывает широкий кадр (напр. 1280x480) и разрезает пополам:
-      левая половина  → LEFT  камера
-      правая половина → RIGHT камера
-    Захват идёт на полном FPS; отображается каждый show_every-й кадр.
+    Захватывает широкий кадр (напр. 1280x480) в фоновом потоке.
+    Главный поток разрезает пополам и отображает каждый show_every-й кадр.
+    Захват идёт на полном FPS независимо от скорости отображения.
     """
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     mid = W // 2
     print(f'  Разрезаем: LEFT=[0:{mid}]  RIGHT=[{mid}:{W}]  каждый глаз: {mid}x{H}')
-    # Заранее выделяем буфер для склеенного кадра — не аллоцируем каждый раз
+
     display_buf = np.empty((H, W + 4, 3), dtype=np.uint8)
-    display_buf[:, mid:mid + 4] = 64  # разделитель (серый)
+    display_buf[:, mid:mid + 4] = 64  # серый разделитель
+
+    grabber = FrameGrabber(cap)
     win = f'Stereo split  {device}  [q - выход]'
     if not no_display:
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    n, d, fps, t = 0, 0, 0.0, time.monotonic()
+
+    disp_n, fps, t = 0, 0.0, time.monotonic()
     print('\nЗахват (split). q / Ctrl-C для выхода.\n')
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                d += 1
-                time.sleep(0.02)
+            ret, frame = grabber.read()
+            if not ret or frame is None:
+                time.sleep(0.005)
                 continue
-            n += 1
-            fps, _ = print_stats(t, n, d)
-            if not no_display and n % show_every == 0:
-                # Копируем половинки в заранее выделенный буфер
-                display_buf[:, :mid]       = frame[:, :mid]
-                display_buf[:, mid + 4:]   = frame[:, mid:]
-                annotate(display_buf[:, :mid],      'LEFT',  fps, n)
-                annotate(display_buf[:, mid + 4:],  'RIGHT', fps, n)
+
+            cap_n = grabber.grabbed
+            el    = time.monotonic() - t
+            fps   = cap_n / el if el > 0 else 0.0
+            print(f'\r  Захват:{cap_n:6d}  FPS:{fps:5.1f}  Время:{el:6.1f}с  ',
+                  end='', flush=True)
+
+            disp_n += 1
+            if not no_display and disp_n % show_every == 0:
+                display_buf[:, :mid]      = frame[:, :mid]
+                display_buf[:, mid + 4:]  = frame[:, mid:]
+                annotate(display_buf[:, :mid],     'LEFT',  fps, cap_n)
+                annotate(display_buf[:, mid + 4:], 'RIGHT', fps, cap_n)
                 cv2.imshow(win, display_buf)
                 if cv2.waitKey(1) & 0xFF in (ord('q'), ord('Q'), 27):
                     break
+            else:
+                time.sleep(0.005)
     except KeyboardInterrupt:
         pass
     finally:
-        _, el = print_stats(t, n, d)
-        print(f'\n\nИтого: {n} кадров, {d} пропусков, {el:.1f}с')
+        grabber.stop()
+        el = time.monotonic() - t
+        print(f'\n\nИтого: {grabber.grabbed} кадров за {el:.1f}с  '
+              f'(FPS: {grabber.grabbed / el:.1f})')
         if not no_display:
             cv2.destroyAllWindows()
 
@@ -223,23 +278,30 @@ def run_split(cap: cv2.VideoCapture, device: str, no_display: bool,
 def run_stereo(cap_l: cv2.VideoCapture, cap_r: cv2.VideoCapture,
                dev_l: str, dev_r: str, no_display: bool,
                show_every: int = 1) -> None:
+    grabber_l = FrameGrabber(cap_l)
+    grabber_r = FrameGrabber(cap_r)
     win = f'Stereo pair  LEFT={dev_l}  RIGHT={dev_r}  [q - выход]'
     if not no_display:
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    n, d, fps, t = 0, 0, 0.0, time.monotonic()
+    disp_n, fps, t = 0, 0.0, time.monotonic()
     display_buf: np.ndarray | None = None
     print(f'\nСтереозахват LEFT={dev_l}  RIGHT={dev_r}. q / Ctrl-C.\n')
     try:
         while True:
-            rl, fl = cap_l.read()
-            rr, fr = cap_r.read()
-            if not rl or not rr:
-                d += 1
-                time.sleep(0.02)
+            rl, fl = grabber_l.read()
+            rr, fr = grabber_r.read()
+            if not rl or fl is None or not rr or fr is None:
+                time.sleep(0.005)
                 continue
-            n += 1
-            fps, _ = print_stats(t, n, d)
-            if not no_display and n % show_every == 0:
+
+            cap_n = min(grabber_l.grabbed, grabber_r.grabbed)
+            el    = time.monotonic() - t
+            fps   = cap_n / el if el > 0 else 0.0
+            print(f'\r  Захват:{cap_n:6d}  FPS:{fps:5.1f}  Время:{el:6.1f}с  ',
+                  end='', flush=True)
+
+            disp_n += 1
+            if not no_display and disp_n % show_every == 0:
                 h = min(fl.shape[0], fr.shape[0])
                 w = fl.shape[1]
                 if display_buf is None or display_buf.shape != (h, w * 2 + 4, 3):
@@ -247,16 +309,21 @@ def run_stereo(cap_l: cv2.VideoCapture, cap_r: cv2.VideoCapture,
                     display_buf[:, w:w + 4] = 64
                 display_buf[:h, :w]       = fl[:h]
                 display_buf[:h, w + 4:]   = fr[:h]
-                annotate(display_buf[:h, :w],     f'LEFT  {dev_l}', fps, n)
-                annotate(display_buf[:h, w + 4:], f'RIGHT {dev_r}', fps, n)
+                annotate(display_buf[:h, :w],     f'LEFT  {dev_l}', fps, cap_n)
+                annotate(display_buf[:h, w + 4:], f'RIGHT {dev_r}', fps, cap_n)
                 cv2.imshow(win, display_buf)
                 if cv2.waitKey(1) & 0xFF in (ord('q'), ord('Q'), 27):
                     break
+            else:
+                time.sleep(0.005)
     except KeyboardInterrupt:
         pass
     finally:
-        _, el = print_stats(t, n, d)
-        print(f'\n\nИтого: {n} кадров, {d} пропусков, {el:.1f}с')
+        grabber_l.stop()
+        grabber_r.stop()
+        el = time.monotonic() - t
+        n = min(grabber_l.grabbed, grabber_r.grabbed)
+        print(f'\n\nИтого: {n} кадров за {el:.1f}с  (FPS: {n / el:.1f})')
         if not no_display:
             cv2.destroyAllWindows()
 

@@ -142,9 +142,18 @@ class StereoCameraNode(Node):
     # ------------------------------------------------------------------
     def _open_capture(self, path: str, width: int, height: int,
                       fps: float) -> cv2.VideoCapture:
-        # Выставляем MJPG через v4l2-ctl ДО открытия OpenCV —
-        # это надёжнее, чем CAP_PROP_FOURCC
         dev_path = f'/dev/video{path}' if path.lstrip('-').isdigit() else path
+        src      = int(path) if path.lstrip('-').isdigit() else path
+
+        # Шаг 1: открываем устройство (стриминг ещё не запущен)
+        cap = cv2.VideoCapture(src, cv2.CAP_V4L2)
+        if not cap.isOpened():
+            self.get_logger().error(f'Cannot open camera: {path}')
+            raise RuntimeError(f'Cannot open camera: {path}')
+
+        # Шаг 2: выставляем формат через v4l2-ctl ПОСЛЕ открытия, но ДО первого read().
+        # НЕ вызываем cap.set(WIDTH/HEIGHT/FOURCC) после этого —
+        # иначе OpenCV переговорит формат и сбросит MJPG → YUYV (макс. 15 fps).
         result = subprocess.run(
             [
                 'v4l2-ctl', '--device', dev_path,
@@ -155,20 +164,10 @@ class StereoCameraNode(Node):
         )
         if result.returncode != 0:
             self.get_logger().warn(
-                f'v4l2-ctl failed for {path}: {result.stderr.strip()} '
-                f'— falling back to OpenCV FOURCC')
+                f'v4l2-ctl failed for {path}: {result.stderr.strip()}')
 
-        src = int(path) if path.lstrip('-').isdigit() else path
-        cap = cv2.VideoCapture(src, cv2.CAP_V4L2)
-        if not cap.isOpened():
-            self.get_logger().error(f'Cannot open camera: {path}')
-            raise RuntimeError(f'Cannot open camera: {path}')
-        # Дублируем через OpenCV на случай если v4l2-ctl недоступен
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        cap.set(cv2.CAP_PROP_FPS,          fps)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+        # Шаг 3: только буфер — формат не трогаем
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         return cap
 
     # ------------------------------------------------------------------
