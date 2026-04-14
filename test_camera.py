@@ -203,30 +203,39 @@ def run_split(cap: cv2.VideoCapture, device: str, no_display: bool,
               show_every: int = 1) -> None:
     """
     Захватывает широкий кадр (напр. 1280x480) в фоновом потоке.
-    Главный поток разрезает пополам и отображает каждый show_every-й кадр.
-    Захват идёт на полном FPS независимо от скорости отображения.
+    W/H берутся из первого реального кадра — не из cap.get() —
+    чтобы корректно работать при любом фактическом разрешении.
     """
-    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    mid = W // 2
-    print(f'  Разрезаем: LEFT=[0:{mid}]  RIGHT=[{mid}:{W}]  каждый глаз: {mid}x{H}')
-
-    display_buf = np.empty((H, W + 4, 3), dtype=np.uint8)
-    display_buf[:, mid:mid + 4] = 64  # серый разделитель
-
     grabber = FrameGrabber(cap)
     win = f'Stereo split  {device}  [q - выход]'
     if not no_display:
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 
+    display_buf: np.ndarray | None = None
+    mid = 0
     disp_n, fps, t = 0, 0.0, time.monotonic()
-    print('\nЗахват (split). q / Ctrl-C для выхода.\n')
+    print('\nОжидаем первый кадр...\n')
     try:
         while True:
             ret, frame = grabber.read()
             if not ret or frame is None:
                 time.sleep(0.005)
                 continue
+
+            # Инициализируем размеры по первому реальному кадру
+            if display_buf is None:
+                H, W = frame.shape[:2]
+                mid = W // 2
+                display_buf = np.empty((H, W + 4, 3), dtype=np.uint8)
+                display_buf[:, mid:mid + 4] = 64
+                print(f'  Реальный кадр: {W}x{H}  '
+                      f'→ LEFT=[0:{mid}]  RIGHT=[{mid}:{W}]  '
+                      f'каждый глаз: {mid}x{H}')
+                if W <= H * 2:  # подозрительно: не похоже на side-by-side
+                    print(f'  [WARN] Ширина {W} мала для side-by-side — '
+                          f'возможно камера отдаёт одиночный кадр. '
+                          f'Попробуйте --no-mjpg или --width 2560 --height 720')
+                print()
 
             cap_n = grabber.grabbed
             el    = time.monotonic() - t
@@ -236,11 +245,12 @@ def run_split(cap: cv2.VideoCapture, device: str, no_display: bool,
 
             disp_n += 1
             if not no_display and disp_n % show_every == 0:
-                display_buf[:, :mid]      = frame[:, :mid]
-                display_buf[:, mid + 4:]  = frame[:, mid:]
-                annotate(display_buf[:, :mid],     'LEFT',  fps, cap_n)
-                annotate(display_buf[:, mid + 4:], 'RIGHT', fps, cap_n)
-                cv2.imshow(win, display_buf)
+                H, W = frame.shape[:2]
+                display_buf[:H, :mid]      = frame[:H, :mid]
+                display_buf[:H, mid + 4:]  = frame[:H, mid:]
+                annotate(display_buf[:H, :mid],     'LEFT',  fps, cap_n)
+                annotate(display_buf[:H, mid + 4:], 'RIGHT', fps, cap_n)
+                cv2.imshow(win, display_buf[:H])
                 if cv2.waitKey(1) & 0xFF in (ord('q'), ord('Q'), 27):
                     break
             else:
