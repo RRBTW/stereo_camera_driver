@@ -18,8 +18,8 @@
   # Без окна (headless / SSH):
   python3 test_camera.py --device 2 --no-display
 
-  # Принудительно YUYV вместо MJPG:
-  python3 test_camera.py --device 2 --width 1280 --height 480 --split --no-mjpg
+  # SBS 30fps (MJPG 2560x720 = два глаза 1280x720):
+  python3 test_camera.py --device 2 --width 2560 --height 720 --split --mjpg
 
 Выход: q или Ctrl-C
 """
@@ -345,20 +345,20 @@ def main() -> None:
                    help='Ширина захвата (для --split: полная, напр. 1280)')
     p.add_argument('--height',     type=int,   default=480)
     p.add_argument('--fps',        type=float, default=30.0)
-    p.add_argument('--no-mjpg',     action='store_true',
-                   help='Не форсировать MJPG (использовать YUYV)')
+    p.add_argument('--mjpg',        action='store_true',
+                   help='Форсировать MJPG. По умолчанию YUYV.\n'
+                        'Для SBS: YUYV 1280x480 = 15fps | MJPG 2560x720 = 30fps')
     p.add_argument('--no-display',  action='store_true',
                    help='Не открывать окно (headless / SSH)')
     p.add_argument('--show-every',  type=int, default=1,
-                   help='Отображать каждый N-й кадр (захват идёт на полном FPS). '
-                        'Напр. --show-every 2 = отображение 15fps при захвате 30fps')
+                   help='Отображать каждый N-й кадр (захват идёт на полном FPS)')
     a = p.parse_args()
 
     if a.list:
         list_cameras()
         return
 
-    mjpg = not a.no_mjpg
+    mjpg = a.mjpg
     show_every = max(1, a.show_every)
 
     if a.split:
