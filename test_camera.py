@@ -119,32 +119,17 @@ def list_cameras() -> None:
 
 def open_cap(device: str, width: int, height: int, fps: float,
              mjpg: bool = True) -> cv2.VideoCapture:
-    dev_path = f'/dev/video{device}' if device.lstrip('-').isdigit() else device
-    src      = int(device) if device.lstrip('-').isdigit() else device
-
-    # Шаг 1: открываем устройство (стриминг ещё не запущен)
+    src = int(device) if device.lstrip('-').isdigit() else device
     cap = cv2.VideoCapture(src, cv2.CAP_V4L2)
     if not cap.isOpened():
         print(f'[ERROR] Не удалось открыть: {device}', file=sys.stderr)
         sys.exit(1)
-
-    # Шаг 2: выставляем формат через v4l2-ctl ПОСЛЕ открытия, но ДО первого read().
-    # Важно: НЕ вызывать cap.set(WIDTH/HEIGHT/FOURCC) после этого —
-    # иначе OpenCV снова переговорит формат и сбросит MJPG обратно на YUYV.
-    pixfmt = 'MJPG' if mjpg else 'YUYV'
-    result = subprocess.run(
-        [
-            'v4l2-ctl', '--device', dev_path,
-            f'--set-fmt-video=width={width},height={height},pixelformat={pixfmt}',
-            f'--set-parm={int(fps)}',
-        ],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        print(f'[WARN] v4l2-ctl: {result.stderr.strip()}')
-
-    # Шаг 3: только размер буфера — не трогаем формат
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    if mjpg:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    cap.set(cv2.CAP_PROP_FPS,          fps)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
     return cap
 
 

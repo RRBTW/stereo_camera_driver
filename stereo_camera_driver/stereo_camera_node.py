@@ -32,8 +32,6 @@ Universal stereo camera node.
   right/camera_info (sensor_msgs/CameraInfo)
 """
 
-import subprocess
-
 import rclpy
 from rclpy.node import Node
 
@@ -145,29 +143,15 @@ class StereoCameraNode(Node):
         dev_path = f'/dev/video{path}' if path.lstrip('-').isdigit() else path
         src      = int(path) if path.lstrip('-').isdigit() else path
 
-        # Шаг 1: открываем устройство (стриминг ещё не запущен)
         cap = cv2.VideoCapture(src, cv2.CAP_V4L2)
         if not cap.isOpened():
             self.get_logger().error(f'Cannot open camera: {path}')
             raise RuntimeError(f'Cannot open camera: {path}')
-
-        # Шаг 2: выставляем формат через v4l2-ctl ПОСЛЕ открытия, но ДО первого read().
-        # НЕ вызываем cap.set(WIDTH/HEIGHT/FOURCC) после этого —
-        # иначе OpenCV переговорит формат и сбросит MJPG → YUYV (макс. 15 fps).
-        result = subprocess.run(
-            [
-                'v4l2-ctl', '--device', dev_path,
-                f'--set-fmt-video=width={width},height={height},pixelformat=MJPG',
-                f'--set-parm={int(fps)}',
-            ],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            self.get_logger().warn(
-                f'v4l2-ctl failed for {path}: {result.stderr.strip()}')
-
-        # Шаг 3: только буфер — формат не трогаем
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        cap.set(cv2.CAP_PROP_FPS,          fps)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
         return cap
 
     # ------------------------------------------------------------------
