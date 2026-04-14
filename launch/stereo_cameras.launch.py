@@ -1,29 +1,24 @@
 """
 Launch-файл: запускает три экземпляра stereo_camera_node.
 
-Топики, которые ожидает потребитель (rtabmap_sync/stereo_sync):
+Поддерживаются два режима на пару (задаётся в CAMERA_PATHS):
+  single_device=False  — два отдельных USB-устройства (left + right)
+  single_device=True   — одно USB-устройство с двойным кадром side-by-side
+                         (указывайте только 'left', поле 'right' игнорируется)
 
-  namespace front_cams  (центральная пара):
-    /front_cams/f_left_camera/image         /front_cams/f_left_camera/camera_info
-    /front_cams/f_right_camera/image        /front_cams/f_right_camera/camera_info
-
-  namespace left_cams   (левая пара):
-    /left_cams/l_left_camera/image          /left_cams/l_left_camera/camera_info
-    /left_cams/l_right_camera/image         /left_cams/l_right_camera/camera_info
-
-  namespace right_cams  (правая пара):
-    /right_cams/r_left_camera/image         /right_cams/r_left_camera/camera_info
-    /right_cams/r_right_camera/image        /right_cams/r_right_camera/camera_info
+Топики (rtabmap_sync/stereo_sync):
+  /front_cams/f_left_camera/image    /front_cams/f_left_camera/camera_info
+  /front_cams/f_right_camera/image   /front_cams/f_right_camera/camera_info
+  /left_cams/l_left_camera/image     ...
+  /right_cams/r_left_camera/image    ...
 
 КАК НАЙТИ ПУТИ КАМЕР:
-  1. Подключите все 6 камер.
-  2. ls -la /dev/v4l/by-path/
-  3. Определите каждый порт (отключая по одной камере).
-  4. Подставьте пути в CAMERA_PATHS ниже.
+  python3 test_camera.py --list
+  или: ls -la /dev/v4l/by-path/
 
-ПЕРЕОПРЕДЕЛЕНИЕ ПАРАМЕТРОВ ИЗ КОМАНДНОЙ СТРОКИ:
+ПЕРЕОПРЕДЕЛЕНИЕ ИЗ КОМАНДНОЙ СТРОКИ:
   ros2 launch stereo_camera_driver stereo_cameras.launch.py \
-      camera_fps:=15.0 frame_width:=1280 frame_height:=720
+      camera_fps:=15.0 frame_width:=640 frame_height:=480
 """
 
 from launch import LaunchDescription
@@ -38,21 +33,24 @@ from launch_ros.parameter_descriptions import ParameterValue  # type: ignore[imp
 CAMERA_PATHS = {
     # --- Центральная стереопара → namespace front_cams ---
     'front_cams': {
-        'left':  '/dev/v4l/by-path/PLACEHOLDER_CENTER_PAIR_LEFT_CAM',   # TODO
-        'right': '/dev/v4l/by-path/PLACEHOLDER_CENTER_PAIR_RIGHT_CAM',  # TODO
-        'prefix': 'f',  # топики будут f_left_camera/... и f_right_camera/...
+        'left':          '/dev/v4l/by-path/PLACEHOLDER_CENTER_PAIR',  # TODO
+        'right':         '/dev/v4l/by-path/PLACEHOLDER_CENTER_PAIR_RIGHT',  # TODO (игнорируется при single_device=True)
+        'prefix':        'f',
+        'single_device': False,  # True — side-by-side камера на одном USB
     },
     # --- Левая стереопара → namespace left_cams ---
     'left_cams': {
-        'left':  '/dev/v4l/by-path/PLACEHOLDER_LEFT_PAIR_LEFT_CAM',     # TODO
-        'right': '/dev/v4l/by-path/PLACEHOLDER_LEFT_PAIR_RIGHT_CAM',    # TODO
-        'prefix': 'l',
+        'left':          '/dev/v4l/by-path/PLACEHOLDER_LEFT_PAIR',    # TODO
+        'right':         '/dev/v4l/by-path/PLACEHOLDER_LEFT_PAIR_RIGHT',    # TODO
+        'prefix':        'l',
+        'single_device': False,
     },
     # --- Правая стереопара → namespace right_cams ---
     'right_cams': {
-        'left':  '/dev/v4l/by-path/PLACEHOLDER_RIGHT_PAIR_LEFT_CAM',    # TODO
-        'right': '/dev/v4l/by-path/PLACEHOLDER_RIGHT_PAIR_RIGHT_CAM',   # TODO
-        'prefix': 'r',
+        'left':          '/dev/v4l/by-path/PLACEHOLDER_RIGHT_PAIR',   # TODO
+        'right':         '/dev/v4l/by-path/PLACEHOLDER_RIGHT_PAIR_RIGHT',   # TODO
+        'prefix':        'r',
+        'single_device': False,
     },
 }
 # =============================================================================
@@ -63,19 +61,14 @@ def _make_stereo_node(
     left_path: str,
     right_path: str,
     prefix: str,
+    single_device: bool,
     fps,
     width,
     height,
 ) -> Node:
     """
     Создаёт Node для одного экземпляра stereo_camera_node.
-
-    Нода публикует left/image_raw и right/image_raw в своём namespace.
-    Ремапинги переименовывают топики так, как ожидает stereo_sync:
-      left/image_raw  → <prefix>_left_camera/image
-      right/image_raw → <prefix>_right_camera/image
-      (аналогично camera_info)
-    Итоговые абсолютные пути:
+    Топики ремапируются так, как ожидает stereo_sync:
       /<namespace>/<prefix>_left_camera/image
       /<namespace>/<prefix>_right_camera/image
     """
@@ -90,6 +83,7 @@ def _make_stereo_node(
             {
                 'left_camera_path':  left_path,
                 'right_camera_path': right_path,
+                'single_device':     single_device,
                 'frame_id_left':  f'{namespace}/{p}_left_camera_optical',
                 'frame_id_right': f'{namespace}/{p}_right_camera_optical',
                 'camera_fps':    fps,
@@ -98,7 +92,6 @@ def _make_stereo_node(
             },
         ],
         remappings=[
-            # image — тип Image; stereo_sync ремапит свой left/image_rect на этот топик
             ('left/image_raw',    f'{p}_left_camera/image'),
             ('left/camera_info',  f'{p}_left_camera/camera_info'),
             ('right/image_raw',   f'{p}_right_camera/image'),
@@ -129,6 +122,7 @@ def generate_launch_description():
             left_path=cfg['left'],
             right_path=cfg['right'],
             prefix=cfg['prefix'],
+            single_device=cfg.get('single_device', False),
             fps=fps,
             width=width,
             height=height,
