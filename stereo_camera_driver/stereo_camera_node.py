@@ -32,6 +32,8 @@ Universal stereo camera node.
   right/camera_info (sensor_msgs/CameraInfo)
 """
 
+import subprocess
+
 import rclpy
 from rclpy.node import Node
 
@@ -140,12 +142,28 @@ class StereoCameraNode(Node):
     # ------------------------------------------------------------------
     def _open_capture(self, path: str, width: int, height: int,
                       fps: float) -> cv2.VideoCapture:
+        # Выставляем MJPG через v4l2-ctl ДО открытия OpenCV —
+        # это надёжнее, чем CAP_PROP_FOURCC
+        dev_path = f'/dev/video{path}' if path.lstrip('-').isdigit() else path
+        result = subprocess.run(
+            [
+                'v4l2-ctl', '--device', dev_path,
+                f'--set-fmt-video=width={width},height={height},pixelformat=MJPG',
+                f'--set-parm={int(fps)}',
+            ],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            self.get_logger().warn(
+                f'v4l2-ctl failed for {path}: {result.stderr.strip()} '
+                f'— falling back to OpenCV FOURCC')
+
         src = int(path) if path.lstrip('-').isdigit() else path
         cap = cv2.VideoCapture(src, cv2.CAP_V4L2)
         if not cap.isOpened():
             self.get_logger().error(f'Cannot open camera: {path}')
             raise RuntimeError(f'Cannot open camera: {path}')
-        # MJPG даёт 30 fps на большинстве камер, YUYV может быть ограничен 15 fps
+        # Дублируем через OpenCV на случай если v4l2-ctl недоступен
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)

@@ -72,11 +72,31 @@ def list_cameras() -> None:
 
 def open_cap(device: str, width: int, height: int, fps: float,
              mjpg: bool = True) -> cv2.VideoCapture:
+    # Определяем путь к устройству для v4l2-ctl
+    dev_path = f'/dev/video{device}' if device.lstrip('-').isdigit() else device
+
+    if mjpg:
+        # Выставляем формат через v4l2-ctl ДО открытия OpenCV —
+        # это надёжнее, чем CAP_PROP_FOURCC (OpenCV может сбросить формат
+        # при выставлении ширины/высоты)
+        result = subprocess.run(
+            [
+                'v4l2-ctl', '--device', dev_path,
+                f'--set-fmt-video=width={width},height={height},pixelformat=MJPG',
+                f'--set-parm={int(fps)}',
+            ],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print(f'[WARN] v4l2-ctl не смог выставить MJPG: {result.stderr.strip()}')
+            print('[WARN] Попытка выставить через OpenCV...')
+
     src = int(device) if device.lstrip('-').isdigit() else device
     cap = cv2.VideoCapture(src, cv2.CAP_V4L2)
     if not cap.isOpened():
         print(f'[ERROR] Не удалось открыть: {device}', file=sys.stderr)
         sys.exit(1)
+    # OpenCV дублирует параметры (на случай если v4l2-ctl недоступен)
     if mjpg:
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
@@ -97,15 +117,11 @@ def print_info(cap: cv2.VideoCapture, device: str, label: str = '') -> None:
     print(f'  Захват     : {w}x{h}  {fourcc}  {f} fps')
 
 
-def annotate(frame: np.ndarray, label: str, fps: float, n: int) -> np.ndarray:
-    out = frame.copy()
-    cv2.putText(out, f'{label}  FPS:{fps:.1f}  f:{n}',
+def annotate(frame: np.ndarray, label: str, fps: float, n: int) -> None:
+    """Рисует текст прямо в кадр (без копии)."""
+    cv2.putText(frame, f'{label}  FPS:{fps:.1f}  f:{n}',
                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-    return out
 
-
-def separator(h: int) -> np.ndarray:
-    return np.full((h, 4, 3), 64, dtype=np.uint8)
 
 
 def print_stats(t_start: float, n: int, d: int = 0) -> tuple[float, float]:
@@ -120,7 +136,8 @@ def print_stats(t_start: float, n: int, d: int = 0) -> tuple[float, float]:
 # Режим одной камеры
 # ---------------------------------------------------------------------------
 
-def run_single(cap: cv2.VideoCapture, label: str, no_display: bool) -> None:
+def run_single(cap: cv2.VideoCapture, label: str, no_display: bool,
+               show_every: int = 1) -> None:
     win = f'Camera {label}  [q - выход]'
     if not no_display:
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
@@ -134,8 +151,9 @@ def run_single(cap: cv2.VideoCapture, label: str, no_display: bool) -> None:
                 continue
             n += 1
             fps, _ = print_stats(t, n)
-            if not no_display:
-                cv2.imshow(win, annotate(frame, label, fps, n))
+            if not no_display and n % show_every == 0:
+                annotate(frame, label, fps, n)
+                cv2.imshow(win, frame)
                 if cv2.waitKey(1) & 0xFF in (ord('q'), ord('Q'), 27):
                     break
     except KeyboardInterrupt:
@@ -151,16 +169,21 @@ def run_single(cap: cv2.VideoCapture, label: str, no_display: bool) -> None:
 # Режим side-by-side (одно USB-устройство, двойной кадр)
 # ---------------------------------------------------------------------------
 
-def run_split(cap: cv2.VideoCapture, device: str, no_display: bool) -> None:
+def run_split(cap: cv2.VideoCapture, device: str, no_display: bool,
+              show_every: int = 1) -> None:
     """
     Захватывает широкий кадр (напр. 1280x480) и разрезает пополам:
       левая половина  → LEFT  камера
       правая половина → RIGHT камера
+    Захват идёт на полном FPS; отображается каждый show_every-й кадр.
     """
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     mid = W // 2
     print(f'  Разрезаем: LEFT=[0:{mid}]  RIGHT=[{mid}:{W}]  каждый глаз: {mid}x{H}')
+    # Заранее выделяем буфер для склеенного кадра — не аллоцируем каждый раз
+    display_buf = np.empty((H, W + 4, 3), dtype=np.uint8)
+    display_buf[:, mid:mid + 4] = 64  # разделитель (серый)
     win = f'Stereo split  {device}  [q - выход]'
     if not no_display:
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
@@ -175,10 +198,13 @@ def run_split(cap: cv2.VideoCapture, device: str, no_display: bool) -> None:
                 continue
             n += 1
             fps, _ = print_stats(t, n, d)
-            if not no_display:
-                L = annotate(frame[:, :mid],  'LEFT',  fps, n)
-                R = annotate(frame[:, mid:], 'RIGHT', fps, n)
-                cv2.imshow(win, np.hstack([L, separator(H), R]))
+            if not no_display and n % show_every == 0:
+                # Копируем половинки в заранее выделенный буфер
+                display_buf[:, :mid]       = frame[:, :mid]
+                display_buf[:, mid + 4:]   = frame[:, mid:]
+                annotate(display_buf[:, :mid],      'LEFT',  fps, n)
+                annotate(display_buf[:, mid + 4:],  'RIGHT', fps, n)
+                cv2.imshow(win, display_buf)
                 if cv2.waitKey(1) & 0xFF in (ord('q'), ord('Q'), 27):
                     break
     except KeyboardInterrupt:
@@ -195,11 +221,13 @@ def run_split(cap: cv2.VideoCapture, device: str, no_display: bool) -> None:
 # ---------------------------------------------------------------------------
 
 def run_stereo(cap_l: cv2.VideoCapture, cap_r: cv2.VideoCapture,
-               dev_l: str, dev_r: str, no_display: bool) -> None:
+               dev_l: str, dev_r: str, no_display: bool,
+               show_every: int = 1) -> None:
     win = f'Stereo pair  LEFT={dev_l}  RIGHT={dev_r}  [q - выход]'
     if not no_display:
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     n, d, fps, t = 0, 0, 0.0, time.monotonic()
+    display_buf: np.ndarray | None = None
     print(f'\nСтереозахват LEFT={dev_l}  RIGHT={dev_r}. q / Ctrl-C.\n')
     try:
         while True:
@@ -211,11 +239,17 @@ def run_stereo(cap_l: cv2.VideoCapture, cap_r: cv2.VideoCapture,
                 continue
             n += 1
             fps, _ = print_stats(t, n, d)
-            if not no_display:
+            if not no_display and n % show_every == 0:
                 h = min(fl.shape[0], fr.shape[0])
-                L = annotate(fl[:h], f'LEFT  {dev_l}', fps, n)
-                R = annotate(fr[:h], f'RIGHT {dev_r}', fps, n)
-                cv2.imshow(win, np.hstack([L, separator(h), R]))
+                w = fl.shape[1]
+                if display_buf is None or display_buf.shape != (h, w * 2 + 4, 3):
+                    display_buf = np.empty((h, w * 2 + 4, 3), dtype=np.uint8)
+                    display_buf[:, w:w + 4] = 64
+                display_buf[:h, :w]       = fl[:h]
+                display_buf[:h, w + 4:]   = fr[:h]
+                annotate(display_buf[:h, :w],     f'LEFT  {dev_l}', fps, n)
+                annotate(display_buf[:h, w + 4:], f'RIGHT {dev_r}', fps, n)
+                cv2.imshow(win, display_buf)
                 if cv2.waitKey(1) & 0xFF in (ord('q'), ord('Q'), 27):
                     break
     except KeyboardInterrupt:
@@ -249,10 +283,13 @@ def main() -> None:
                    help='Ширина захвата (для --split: полная, напр. 1280)')
     p.add_argument('--height',     type=int,   default=480)
     p.add_argument('--fps',        type=float, default=30.0)
-    p.add_argument('--no-mjpg',    action='store_true',
+    p.add_argument('--no-mjpg',     action='store_true',
                    help='Не форсировать MJPG (использовать YUYV)')
-    p.add_argument('--no-display', action='store_true',
+    p.add_argument('--no-display',  action='store_true',
                    help='Не открывать окно (headless / SSH)')
+    p.add_argument('--show-every',  type=int, default=1,
+                   help='Отображать каждый N-й кадр (захват идёт на полном FPS). '
+                        'Напр. --show-every 2 = отображение 15fps при захвате 30fps')
     a = p.parse_args()
 
     if a.list:
@@ -260,14 +297,15 @@ def main() -> None:
         return
 
     mjpg = not a.no_mjpg
+    show_every = max(1, a.show_every)
 
     if a.split:
         print(f'\n=== Side-by-side: {a.device}  {a.width}x{a.height} @ {a.fps} fps'
-              f'  MJPG={mjpg} ===')
+              f'  MJPG={mjpg}  show_every={show_every} ===')
         cap = open_cap(a.device, a.width, a.height, a.fps, mjpg)
         print_info(cap, a.device, 'SBS')
         try:
-            run_split(cap, a.device, a.no_display)
+            run_split(cap, a.device, a.no_display, show_every)
         finally:
             cap.release()
 
@@ -278,7 +316,7 @@ def main() -> None:
         print('LEFT:');  print_info(cl, a.device,  'LEFT')
         print('RIGHT:'); print_info(cr, a.device2, 'RIGHT')
         try:
-            run_stereo(cl, cr, a.device, a.device2, a.no_display)
+            run_stereo(cl, cr, a.device, a.device2, a.no_display, show_every)
         finally:
             cl.release()
             cr.release()
@@ -288,7 +326,7 @@ def main() -> None:
         cap = open_cap(a.device, a.width, a.height, a.fps, mjpg)
         print_info(cap, a.device)
         try:
-            run_single(cap, a.device, a.no_display)
+            run_single(cap, a.device, a.no_display, show_every)
         finally:
             cap.release()
 
