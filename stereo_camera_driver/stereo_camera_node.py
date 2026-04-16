@@ -257,9 +257,9 @@ class StereoCameraNode(Node):
 
         # --- публикаторы ---
         qos = rclpy.qos.QoSProfile(
-            reliability=rclpy.qos.ReliabilityPolicy.BEST_EFFORT,
+            reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
             history=rclpy.qos.HistoryPolicy.KEEP_LAST,
-            depth=1,
+            depth=5,
         )
         self._pub_left_img   = self.create_publisher(Image,      'left/image_raw',    qos)
         self._pub_left_info  = self.create_publisher(CameraInfo, 'left/camera_info',  qos)
