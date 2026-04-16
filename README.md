@@ -159,6 +159,31 @@ python3 test_camera.py --device /dev/stereo_cam0 --width 1280 --height 480 \
 | `frame_height` | int | `480` | Высота кадра |
 | `frame_id_left` | string | `left_camera_optical` | TF frame левой камеры |
 | `frame_id_right` | string | `right_camera_optical` | TF frame правой камеры |
+| `reconnect_sec` | double | `2.0` | Пауза между попытками реконнекта |
+
+---
+
+## Автореконнект
+
+Нода не падает при отключении камеры — она ждёт и переподключается автоматически.
+
+**Поведение при отвале USB:**
+```
+[WARN] Camera disconnected: /dev/stereo_cam0 — ожидаю переподключения...
+```
+Нода перестаёт публикации топиков, но остаётся живой. Каждые `reconnect_sec` секунд
+пробует открыть устройство снова.
+
+**После втыкания обратно:**
+```
+[INFO] Camera connected: /dev/stereo_cam0
+  MJPGCapture 1280x480: OK
+```
+Публикация возобновляется автоматически без перезапуска launch.
+
+**Механизм детектирования отвала** (в порядке приоритета):
+1. `DQBUF` вернул `OSError` (EIO / ENODEV) — мгновенно
+2. 5 подряд таймаутов `select()` по 1с = ~5с без кадров
 
 ---
 
@@ -183,21 +208,32 @@ stereo_camera_driver  →  stereo_sync (×3)  →  rgbd_image (×3)
 ## Архитектура
 
 ```
-MJPGCapture (V4L2 ioctl)
-    │  прямой mmap захват MJPG 1280×480
-    ▼
-_FrameGrabber (фоновый поток)
-    │  последний кадр без блокировки
-    ▼
-split_stereo()
-    │  frame[:, :640]   frame[:, 640:]
-    ▼                        ▼
-left 640×480            right 640×480
-    │                        │
-cv2_to_imgmsg           cv2_to_imgmsg
-    │                        │
-left/image_raw          right/image_raw
-left/camera_info        right/camera_info
+                    ┌─────────────────────────────┐
+                    │       _FrameGrabber          │
+                    │      (фоновый поток)         │
+                    │                              │
+                    │  нет cap? ──► open() ──────► retry after reconnect_sec
+                    │       │                      │
+                    │   MJPGCapture                │
+                    │   (V4L2 ioctl + mmap)        │
+                    │   MJPG 1280×480              │
+                    │       │                      │
+                    │  OSError? ──► close() ──────►│
+                    │  5× timeout? ──► close() ───►│
+                    │       │                      │
+                    │  on_connect(True/False) ──► logger
+                    └──────────┬──────────────────-┘
+                               │ последний кадр (lock-free read)
+                               ▼
+                         split_stereo()
+                    frame[:, :640]   frame[:, 640:]
+                          ▼                ▼
+                    left 640×480    right 640×480
+                          │                │
+                    cv2_to_imgmsg    cv2_to_imgmsg
+                          │                │
+                   left/image_raw   right/image_raw
+                   left/camera_info right/camera_info
 ```
 
 `CameraInfo` публикуется с нулевой калибровкой. Для работы глубины
