@@ -3,19 +3,17 @@
 Автономный тест камеры — без ROS, только OpenCV.
 
 Использование:
-  # Список устройств:
+  # 1. Показать все доступные V4L2-устройства и по-path имена:
   python3 test_camera.py --list
 
-  # Одна камера:
+  # 2. Тест одной камеры (по номеру или по пути):
   python3 test_camera.py --device 2
+  python3 test_camera.py --device /dev/v4l/by-path/pci-...-video-index0
 
-  # Две отдельные камеры (два USB-устройства):
+  # 3. Тест стереопары — две камеры одновременно:
   python3 test_camera.py --device 0 --device2 2
 
-  # Одно USB-устройство с двойным кадром side-by-side (например 1280x480):
-  python3 test_camera.py --device 2 --width 1280 --height 480 --split
-
-  # Без окна (headless / SSH):
+  # 4. Без окна (headless / SSH без -X):
   python3 test_camera.py --device 2 --no-display
 
 Выход: q или Ctrl-C
@@ -37,14 +35,17 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 def list_cameras() -> None:
+    """Выводит все /dev/video* и соответствующие by-path симлинки."""
     videos = sorted(glob.glob('/dev/video*'))
     if not videos:
         print('Устройства /dev/video* не найдены.')
         return
+
     by_path_map: dict[str, list[str]] = {}
     for link in sorted(glob.glob('/dev/v4l/by-path/*')):
         real = os.path.realpath(link)
         by_path_map.setdefault(real, []).append(link)
+
     print(f'{"УСТРОЙСТВО":<20}  {"DRIVER/NAME":<30}  BY-PATH')
     print('-' * 90)
     for dev in videos:
@@ -52,13 +53,16 @@ def list_cameras() -> None:
         try:
             out = subprocess.check_output(
                 ['v4l2-ctl', '--device', dev, '--info'],
-                stderr=subprocess.DEVNULL, timeout=2).decode()
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            ).decode()
             for line in out.splitlines():
                 if 'Card type' in line:
                     name = line.split(':', 1)[-1].strip()
                     break
         except Exception:
             pass
+
         real = os.path.realpath(dev)
         paths = by_path_map.get(real, [])
         first = paths[0] if paths else '—'
@@ -68,6 +72,7 @@ def list_cameras() -> None:
 
 
 def open_camera(device: str, width: int, height: int, fps: float) -> cv2.VideoCapture:
+    """Открывает камеру через V4L2 и задаёт параметры."""
     src = int(device) if device.lstrip('-').isdigit() else device
     cap = cv2.VideoCapture(src, cv2.CAP_V4L2)
     if not cap.isOpened():
@@ -81,6 +86,7 @@ def open_camera(device: str, width: int, height: int, fps: float) -> cv2.VideoCa
 
 
 def print_camera_info(cap: cv2.VideoCapture, device: str, label: str = '') -> None:
+    """Выводит реальные параметры захвата после открытия."""
     actual_w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     actual_fps = cap.get(cv2.CAP_PROP_FPS)
@@ -88,19 +94,17 @@ def print_camera_info(cap: cv2.VideoCapture, device: str, label: str = '') -> No
     fourcc     = ''.join(chr((fmt_raw >> i) & 0xFF) for i in (0, 8, 16, 24))
     tag = f' [{label}]' if label else ''
     print(f'  Устройство{tag}: {device}')
-    print(f'  Захват     : {actual_w} x {actual_h}  ({fourcc})')
+    print(f'  Разрешение : {actual_w} x {actual_h}')
     print(f'  FPS        : {actual_fps}')
+    print(f'  Формат     : {fourcc}')
 
 
-def annotate(frame: np.ndarray, label: str, fps: float, count: int) -> np.ndarray:
+def _annotate(frame: np.ndarray, label: str, fps: float, count: int) -> np.ndarray:
+    """Рисует метку и FPS поверх кадра."""
     out = frame.copy()
     cv2.putText(out, f'{label}  FPS:{fps:.1f}  f:{count}',
                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
     return out
-
-
-def separator(h: int) -> np.ndarray:
-    return np.full((h, 4, 3), 64, dtype=np.uint8)
 
 
 # ---------------------------------------------------------------------------
@@ -111,23 +115,29 @@ def run_single(cap: cv2.VideoCapture, label: str, no_display: bool) -> None:
     window = f'Camera {label}  [q - выход]'
     if not no_display:
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-    frame_count = 0
+
+    frame_count  = 0
     fps_measured = 0.0
-    t_start = time.monotonic()
+    t_start      = time.monotonic()
+
     print(f'\nЗахват [{label}] запущен. q или Ctrl-C для выхода.\n')
     try:
         while True:
             ret, frame = cap.read()
             if not ret:
+                print('[WARN] Кадр не получен')
                 time.sleep(0.05)
                 continue
+
             frame_count += 1
             elapsed = time.monotonic() - t_start
             fps_measured = frame_count / elapsed
+
             print(f'\r  Кадров: {frame_count:6d}  FPS: {fps_measured:5.1f}  '
                   f'Время: {elapsed:6.1f} с  ', end='', flush=True)
+
             if not no_display:
-                cv2.imshow(window, annotate(frame, label, fps_measured, frame_count))
+                cv2.imshow(window, _annotate(frame, label, fps_measured, frame_count))
                 if cv2.waitKey(1) & 0xFF in (ord('q'), ord('Q'), 27):
                     break
     except KeyboardInterrupt:
@@ -141,97 +151,68 @@ def run_single(cap: cv2.VideoCapture, label: str, no_display: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Режим side-by-side (одно устройство, двойной кадр)
+# Режим стереопары
 # ---------------------------------------------------------------------------
 
-def run_split(cap: cv2.VideoCapture, device: str, no_display: bool) -> None:
+def run_stereo(
+    cap_l: cv2.VideoCapture,
+    cap_r: cv2.VideoCapture,
+    dev_l: str,
+    dev_r: str,
+    no_display: bool,
+) -> None:
     """
-    Захватывает широкий кадр и разрезает пополам по горизонтали.
-    Левая половина → LEFT, правая → RIGHT.
+    Захватывает кадры с обеих камер синхронно (как в stereo_camera_node).
+    Показывает их рядом в одном окне.
+    Печатает в терминал: FPS пары и счётчик пропущенных кадров.
     """
-    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    mid = actual_w // 2
-    print(f'  Разрезаем по x={mid}:  LEFT=[0:{mid}]  RIGHT=[{mid}:{actual_w}]')
-
-    window = f'Stereo split  {device}  [q - выход]'
+    window = 'Stereo pair  [q - выход]'
     if not no_display:
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
 
     frame_count  = 0
     drop_count   = 0
     fps_measured = 0.0
-    t_start = time.monotonic()
-    print(f'\nЗахват (split) запущен. q или Ctrl-C для выхода.\n')
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                drop_count += 1
-                time.sleep(0.02)
-                continue
-            frame_count += 1
-            elapsed = time.monotonic() - t_start
-            fps_measured = frame_count / elapsed
-            print(f'\r  Кадров: {frame_count:6d}  FPS: {fps_measured:5.1f}  '
-                  f'Пропусков: {drop_count:3d}  Время: {elapsed:6.1f} с  ',
-                  end='', flush=True)
-            if not no_display:
-                left  = frame[:, :mid]
-                right = frame[:, mid:]
-                ann_l = annotate(left,  'LEFT',  fps_measured, frame_count)
-                ann_r = annotate(right, 'RIGHT', fps_measured, frame_count)
-                cv2.imshow(window, np.hstack([ann_l, separator(actual_h), ann_r]))
-                if cv2.waitKey(1) & 0xFF in (ord('q'), ord('Q'), 27):
-                    break
-    except KeyboardInterrupt:
-        pass
-    finally:
-        elapsed = time.monotonic() - t_start
-        print(f'\n\nИтого: {frame_count} кадров, {drop_count} пропусков, '
-              f'{elapsed:.1f} с  (средний FPS: {frame_count / elapsed:.1f})')
-        if not no_display:
-            cv2.destroyAllWindows()
+    t_start      = time.monotonic()
 
-
-# ---------------------------------------------------------------------------
-# Режим двух отдельных устройств
-# ---------------------------------------------------------------------------
-
-def run_stereo(cap_l: cv2.VideoCapture, cap_r: cv2.VideoCapture,
-               dev_l: str, dev_r: str, no_display: bool) -> None:
-    window = 'Stereo pair  [q - выход]'
-    if not no_display:
-        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-    frame_count = 0
-    drop_count  = 0
-    fps_measured = 0.0
-    t_start = time.monotonic()
     print(f'\nСтереозахват  LEFT={dev_l}  RIGHT={dev_r}')
     print('q или Ctrl-C для выхода.\n')
+
     try:
         while True:
             ret_l, frame_l = cap_l.read()
             ret_r, frame_r = cap_r.read()
+
             if not ret_l or not ret_r:
                 drop_count += 1
-                print(f'\r[WARN] пропуск #{drop_count} (left={ret_l}, right={ret_r})  ',
-                      flush=True)
+                print(f'\r[WARN] пропуск #{drop_count}  '
+                      f'(left={ret_l}, right={ret_r})          ', flush=True)
                 time.sleep(0.02)
                 continue
+
             frame_count += 1
-            elapsed = time.monotonic() - t_start
+            elapsed      = time.monotonic() - t_start
             fps_measured = frame_count / elapsed
+
             print(f'\r  Кадров: {frame_count:6d}  FPS: {fps_measured:5.1f}  '
                   f'Пропусков: {drop_count:3d}  Время: {elapsed:6.1f} с  ',
                   end='', flush=True)
+
             if not no_display:
-                ann_l = annotate(frame_l, f'LEFT  {dev_l}',  fps_measured, frame_count)
-                ann_r = annotate(frame_r, f'RIGHT {dev_r}', fps_measured, frame_count)
+                ann_l = _annotate(frame_l, f'LEFT  {dev_l}',  fps_measured, frame_count)
+                ann_r = _annotate(frame_r, f'RIGHT {dev_r}', fps_measured, frame_count)
+
+                # Привести к одинаковой высоте на случай разных разрешений
                 h = min(ann_l.shape[0], ann_r.shape[0])
-                cv2.imshow(window, np.hstack([ann_l[:h], separator(h), ann_r[:h]]))
+                combined = np.hstack([
+                    ann_l[:h],
+                    np.full((h, 4, 3), 64, dtype=np.uint8),  # разделитель
+                    ann_r[:h],
+                ])
+                cv2.imshow(window, combined)
                 if cv2.waitKey(1) & 0xFF in (ord('q'), ord('Q'), 27):
                     break
+
     except KeyboardInterrupt:
         pass
     finally:
@@ -248,24 +229,22 @@ def run_stereo(cap_l: cv2.VideoCapture, cap_r: cv2.VideoCapture,
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description='Тест камеры/стереопары (без ROS)',
+        description='Тест захвата камеры/стереопары (без ROS)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     parser.add_argument('--list',       action='store_true',
                         help='Показать все V4L2-устройства и выйти')
     parser.add_argument('--device',     default='0',
-                        help='Камера (путь или номер, default: 0)')
+                        help='Левая/единственная камера (путь или номер, default: 0)')
     parser.add_argument('--device2',    default=None,
-                        help='Вторая камера — режим двух отдельных устройств')
-    parser.add_argument('--split',      action='store_true',
-                        help='Разрезать широкий кадр пополам (side-by-side камера)')
-    parser.add_argument('--width',      type=int,   default=640,
-                        help='Ширина захвата (для --split используйте полную ширину, напр. 1280)')
+                        help='Правая камера — включает режим стереопары')
+    parser.add_argument('--width',      type=int,   default=640)
     parser.add_argument('--height',     type=int,   default=480)
     parser.add_argument('--fps',        type=float, default=30.0)
     parser.add_argument('--no-display', action='store_true',
                         help='Не открывать окно (headless / SSH)')
+
     args = parser.parse_args()
 
     if args.list:
@@ -274,29 +253,20 @@ def main() -> None:
 
     w, h, fps = args.width, args.height, args.fps
 
-    if args.split:
-        # --- режим side-by-side ---
-        print(f'\n=== Side-by-side камера: {args.device}  захват {w}x{h} @ {fps} fps ===')
-        cap = open_camera(args.device, w, h, fps)
-        print_camera_info(cap, args.device, 'SBS')
-        try:
-            run_split(cap, args.device, args.no_display)
-        finally:
-            cap.release()
-
-    elif args.device2 is not None:
-        # --- режим двух устройств ---
+    if args.device2 is not None:
+        # --- режим стереопары ---
         print(f'\n=== Стереопара: LEFT={args.device}  RIGHT={args.device2} ===')
         cap_l = open_camera(args.device,  w, h, fps)
         cap_r = open_camera(args.device2, w, h, fps)
-        print('LEFT:');  print_camera_info(cap_l, args.device,  'LEFT')
-        print('RIGHT:'); print_camera_info(cap_r, args.device2, 'RIGHT')
+        print('LEFT:')
+        print_camera_info(cap_l, args.device,  'LEFT')
+        print('RIGHT:')
+        print_camera_info(cap_r, args.device2, 'RIGHT')
         try:
             run_stereo(cap_l, cap_r, args.device, args.device2, args.no_display)
         finally:
             cap_l.release()
             cap_r.release()
-
     else:
         # --- режим одной камеры ---
         print(f'\n=== Открываем камеру: {args.device} ===')
